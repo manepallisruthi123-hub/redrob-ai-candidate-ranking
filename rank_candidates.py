@@ -1,32 +1,49 @@
+"""
+Intelligent Candidate Discovery — Redrob AI Hackathon
+Team: Tech Titans | Team Leader: Manepalli Sruthi
+
+Semantic-first candidate ranking pipeline:
+  1. Stream & clean raw candidate pool (honeypot + IT-giant filtering)
+  2. Compute verified skill competency score
+  3. Batch-encode full pool with sentence-transformer embeddings
+  4. Normalize both scores, blend 0.4 skill / 0.6 semantic
+  5. Apply behavioral reachability multiplier
+  6. Output ranked top 100 with traceable per-candidate reasoning
+"""
+
 import json
-import gzip
 import os
 import csv
 import numpy as np
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
 
-# Define global pipeline paths
+# ── Config ────────────────────────────────────────────────────────────────────
 TARGET_FILE = "candidates.jsonl"
 OUTPUT_FILE = "submission.csv"
 
 
-def stream_and_filter_candidates(compressed_file_path):
+# ── Stage 1: Stream & filter ──────────────────────────────────────────────────
+def stream_and_filter_candidates(file_path):
     """
-    Streams candidates from the massive gzipped JSONL dataset line-by-line,
-    filtering out Honeypots and IT Outsourcing service giants on the fly.
+    Streams candidates line-by-line from a JSONL file.
+    Removes two trap patterns before any scoring happens:
+      - Honeypot profiles: skill duration > total career experience
+      - IT-outsourcing-only histories: entire career at service giants
     """
-    service_giants = {"tcs", "infosys", "wipro", "cognizant", "accenture", "tech mahindra", "mindtree"}
+    service_giants = {
+        "tcs", "infosys", "wipro", "cognizant", "accenture",
+        "tech mahindra", "mindtree"
+    }
     passed_candidates = []
     honeypot_count = 0
     service_giant_count = 0
     total_processed = 0
 
-    print(f"🚀 Open and streaming file data pipeline: {compressed_file_path}...")
+    print(f"🚀 Streaming candidate pool from: {file_path}...")
 
-    # Change from gzip.open to open as the file is not gzipped
-    with open(compressed_file_path, 'r', encoding='utf-8') as file:
-        for line in file:
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
             total_processed += 1
             candidate = json.loads(line.strip())
 
@@ -34,98 +51,99 @@ def stream_and_filter_candidates(compressed_file_path):
             career_history = candidate.get("career_history", [])
             skills = candidate.get("skills", [])
 
-            # --- TRAP 1 CHECK: Honeypot Detection ---
+            # Trap 1: Honeypot detection
             years_exp = profile.get("years_of_experience", 0)
-            total_allowed_months = years_exp * 12
-            is_honeypot = False
-
-            for skill in skills:
-                if skill.get("duration_months", 0) > (total_allowed_months + 2):
-                    is_honeypot = True
-                    break
-
+            allowed_months = years_exp * 12
+            is_honeypot = any(
+                skill.get("duration_months", 0) > (allowed_months + 2)
+                for skill in skills
+            )
             if is_honeypot:
                 honeypot_count += 1
                 continue
 
-            # --- TRAP 2 CHECK: IT Service Giant Filtering ---
-            all_companies = [str(job.get("company", "")).lower() for job in career_history]
-            if all_companies and all(any(giant in comp for giant in all_companies) for comp in service_giants):
+            # Trap 2: IT service-giant filter (only when ALL companies match)
+            companies = [str(job.get("company", "")).lower() for job in career_history]
+            if companies and all(
+                any(giant in co for giant in service_giants) for co in companies
+            ):
                 service_giant_count += 1
                 continue
 
             passed_candidates.append(candidate)
 
-    print("\n🏁 --- Streaming Phase Complete ---")
-    print(f"Total Profiles Streamed: {total_processed}")
-    print(f"❌ Honeypot Traps Defused & Removed: {honeypot_count}")
-    print(f"❌ IT Service Giant Profiles Excluded: {service_giant_count}")
-    print(f"✅ High-Quality Candidates Passed to Pool: {len(passed_candidates)}")
-
+    print(f"\n✅ Streaming complete")
+    print(f"   Total streamed       : {total_processed}")
+    print(f"   Honeypots removed    : {honeypot_count}")
+    print(f"   IT-giants excluded   : {service_giant_count}")
+    print(f"   Passed to scoring    : {len(passed_candidates)}")
     return passed_candidates
 
-    def calculate_skill_score_final(candidate):
+
+# ── Stage 2: Skill competency score ──────────────────────────────────────────
+def calculate_skill_score_final(candidate):
     """
-    Calculates a verified technical competency score.
-    Ensures case-insensitive lookups for both target skills and platform tests.
+    Verified technical competency score across 15 core NLP/ML/search skills.
+    Blends proficiency tier, tenure, endorsements, and official assessments.
+    Applies x1.25 depth bonus when 3+ core skills are matched.
     """
     target_skills = {
         "nlp", "embeddings", "vector search", "fine-tuning llms",
         "mlops", "information retrieval", "dense retrieval", "hybrid search",
-        "pinecone", "weaviate", "qdrant", "milvus", "faiss", "opensearch", "elasticsearch"
+        "pinecone", "weaviate", "qdrant", "milvus", "faiss",
+        "opensearch", "elasticsearch"
     }
-
-    candidate_skills = candidate.get("skills", [])
-    signals = candidate.get("redrob_signals", {})
-
-    raw_assessments = signals.get("skill_assessment_scores", {})
-    assessment_scores_lowercase = {k.lower(): v for k, v in raw_assessments.items()}
-
-    total_skill_weight = 0.0
-    matched_core_count = 0
     proficiency_map = {"beginner": 1, "intermediate": 2, "advanced": 3, "expert": 4}
 
-    for skill in candidate_skills:
-        skill_name_lower = skill.get("name", "").lower()
+    signals = candidate.get("redrob_signals", {})
+    raw_assessments = signals.get("skill_assessment_scores", {})
+    assessments = {k.lower(): v for k, v in raw_assessments.items()}
 
-        if skill_name_lower in target_skills:
-            matched_core_count += 1
-            prof_str = skill.get("proficiency", "beginner")
-            base_multiplier = proficiency_map.get(prof_str, 1)
-            duration = skill.get("duration_months", 0)
-            endorsements = skill.get("endorsements", 0)
+    total_weight = 0.0
+    matched_count = 0
 
-            calculated_trust = (duration * 0.1) + (endorsements * 0.05)
-            skill_entry_score = base_multiplier * (1 + calculated_trust)
+    for skill in candidate.get("skills", []):
+        name = skill.get("name", "").lower()
+        if name not in target_skills:
+            continue
 
-            if skill_name_lower in assessment_scores_lowercase:
-                official_score = assessment_scores_lowercase[skill_name_lower]
-                skill_entry_score = (skill_entry_score * 0.4) + (official_score * 0.6)
+        matched_count += 1
+        base = proficiency_map.get(skill.get("proficiency", "beginner"), 1)
+        duration = skill.get("duration_months", 0)
+        endorsements = skill.get("endorsements", 0)
+        trust = (duration * 0.1) + (endorsements * 0.05)
+        entry_score = base * (1 + trust)
 
-            total_skill_weight += skill_entry_score
+        if name in assessments:
+            entry_score = (entry_score * 0.4) + (assessments[name] * 0.6)
 
-    if matched_core_count >= 3:
-        total_skill_weight *= 1.25
+        total_weight += entry_score
 
-    return total_skill_weight
+    if matched_count >= 3:
+        total_weight *= 1.25
 
-    def calculate_behavioral_multiplier(candidate):
+    return total_weight
+
+
+# ── Stage 2b: Behavioral multiplier ──────────────────────────────────────────
+def calculate_behavioral_multiplier(candidate):
     """
-    Computes a multiplicative modifier based on real platform activity metrics.
+    Multiplicative modifier from real platform-activity signals.
+    Rewards reachability; penalises stale or unresponsive profiles.
     """
     signals = candidate.get("redrob_signals", {})
     multiplier = 1.0
 
-    if signals.get("open_to_work_flag", False) is True:
+    if signals.get("open_to_work_flag", False):
         multiplier *= 1.15
 
     last_active_str = signals.get("last_active_date", "")
     if last_active_str:
         try:
-            last_active = datetime.strptime(last_active_str, "%Y-%m-%d")
-            benchmark_date = datetime(2026, 6, 19)
-            days_inactive = (benchmark_date - last_active).days
-
+            days_inactive = (
+                datetime(2026, 6, 19)
+                - datetime.strptime(last_active_str, "%Y-%m-%d")
+            ).days
             if days_inactive > 180:
                 multiplier *= 0.50
             elif days_inactive > 90:
@@ -155,212 +173,142 @@ def stream_and_filter_candidates(compressed_file_path):
 
     return multiplier
 
+
 def min_max_normalize(vector):
-    """Scales numeric arrays strictly between 0.0 and 1.0."""
+    """Min-max scale a list of floats to [0, 1]."""
     arr = np.array(vector, dtype=np.float32)
-    min_val = arr.min()
-    max_val = arr.max()
-    if max_val == min_val:
+    lo, hi = arr.min(), arr.max()
+    if hi == lo:
         return np.zeros_like(arr)
-    return (arr - min_val) / (max_val - min_val)
+    return (arr - lo) / (hi - lo)
 
-    def run_production_semantic_pipeline(passed_candidates, output_filename="submission.csv"):
-    """
-    True Semantic Pipeline: Batches text embeddings across ALL candidates,
-    normalizes features to prevent scaling dominance, applies behavioral signals,
-    and outputs hyper-customized, data-tiered professional justifications.
-    """
-    print("📦 Loading local semantic embedding model...")
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    jd_anchor_text = (
+# ── Stage 3–5: Semantic pipeline ──────────────────────────────────────────────
+def run_production_semantic_pipeline(passed_candidates, output_filename="submission.csv"):
+    """
+    Full-pool semantic ranking:
+      - Batch-encodes every surviving candidate (all-MiniLM-L6-v2)
+      - Normalizes skill + semantic scores independently (min-max)
+      - Blends: 0.4 x skill + 0.6 x semantic
+      - Multiplies by behavioral reachability modifier
+      - Sorts top 100, writes submission.csv with per-candidate reasoning
+    """
+    print("📦 Loading sentence-transformer model (all-MiniLM-L6-v2)...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    jd_text = (
         "Senior AI Engineer Founding Team. Deep technical depth in modern ML systems, "
         "embeddings, retrieval, ranking, LLMs, and fine-tuning. Scrappy product-engineering "
         "attitude comfortable building production RAG pipelines, search architectures, "
         "vector indexes, and evaluation frameworks from scratch in a fast-paced startup."
     )
-    jd_vector = embedding_model.encode(jd_anchor_text, convert_to_numpy=True)
+    jd_vector = model.encode(jd_text, convert_to_numpy=True)
 
-    print(f"⏳ Extracting narratives and computing technical skills for all {len(passed_candidates)} candidates...")
+    print(f"⏳ Scoring all {len(passed_candidates)} candidates...")
     narratives = []
     raw_skill_scores = []
 
     for cand in passed_candidates:
         raw_skill_scores.append(calculate_skill_score_final(cand))
         prof = cand.get("profile", {})
-        narrative = f"Title: {prof.get('current_title', '')}. Headline: {prof.get('headline', '')}. Summary: {prof.get('summary', '')}"
-        narratives.append(narrative)
+        narratives.append(
+            f"Title: {prof.get('current_title', '')}. "
+            f"Headline: {prof.get('headline', '')}. "
+            f"Summary: {prof.get('summary', '')}"
+        )
 
-    print("📦 Vectorizing profiles via Batched Sentence Transformers (MiniLM)...")
-    candidate_embeddings = embedding_model.encode(narratives, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
+    print("🔢 Batch-encoding full candidate pool...")
+    embeddings = model.encode(
+        narratives, batch_size=128, show_progress_bar=True, convert_to_numpy=True
+    )
 
-    print("🎯 Calculating structural cosine similarities against Job Description...")
-    norms_jd = np.linalg.norm(jd_vector)
-    norms_candidates = np.linalg.norm(candidate_embeddings, axis=1)
-    norms_candidates[norms_candidates == 0] = 1.0
-    raw_semantic_scores = np.dot(candidate_embeddings, jd_vector) / (norms_jd * norms_candidates)
+    print("🎯 Computing cosine similarities against JD...")
+    norm_jd = np.linalg.norm(jd_vector)
+    norm_cands = np.linalg.norm(embeddings, axis=1)
+    norm_cands[norm_cands == 0] = 1.0
+    raw_semantic = np.dot(embeddings, jd_vector) / (norm_jd * norm_cands)
 
-    print("⚖️ Applying Min-Max scaling to equalize score boundaries...")
-    normalized_skills = min_max_normalize(raw_skill_scores)
-    normalized_semantics = min_max_normalize(raw_semantic_scores)
+    print("⚖️  Normalizing and blending scores...")
+    norm_skills = min_max_normalize(raw_skill_scores)
+    norm_semantic = min_max_normalize(raw_semantic)
 
-    print("🔄 Blending indices and computing behavioral platform weights...")
-    final_scored_pool = []
-
+    final_pool = []
     for idx, cand in enumerate(passed_candidates):
-        composite_base = (normalized_skills[idx] * 0.4) + (normalized_semantics[idx] * 0.6)
-        behavioral_mod = calculate_behavioral_multiplier(cand)
-        final_score = round(float(composite_base * behavioral_mod), 4)
-
-        final_scored_pool.append({
+        composite = (norm_skills[idx] * 0.4) + (norm_semantic[idx] * 0.6)
+        behavioral = calculate_behavioral_multiplier(cand)
+        final_score = round(float(composite * behavioral), 4)
+        final_pool.append({
             "candidate_id": cand.get("candidate_id"),
             "score": final_score,
-            "raw_semantic": round(float(raw_semantic_scores[idx]), 2),
+            "raw_semantic": round(float(raw_semantic[idx]), 2),
             "profile": cand.get("profile", {}),
-            "signals": cand.get("redrob_signals", {})
+            "signals": cand.get("redrob_signals", {}),
         })
 
-    # Strict Tie-Breaker Sorting Rule
-    final_scored_pool.sort(key=lambda x: (-x["score"], x["candidate_id"]))
-    top_100 = final_scored_pool[:100]
+    # Sort: score descending, candidate_id ascending for ties
+    final_pool.sort(key=lambda x: (-x["score"], x["candidate_id"]))
+    top_100 = final_pool[:100]
 
-    print(f"📝 Writing exactly {len(top_100)} highly calibrated records to '{output_filename}'...")
-
-    with open(output_filename, mode="w", encoding="utf-8", newline="") as csv_file:
-        fieldnames = ["candidate_id", "rank", "score", "reasoning"]
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    print(f"📝 Writing top {len(top_100)} candidates to '{output_filename}'...")
+    with open(output_filename, mode="w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["candidate_id", "rank", "score", "reasoning"])
         writer.writeheader()
 
-        for index, item in enumerate(top_100):
-            rank = index + 1
+        for rank, item in enumerate(top_100, start=1):
             prof = item["profile"]
             sigs = item["signals"]
-
             title = prof.get("current_title", "Engineer")
             exp = prof.get("years_of_experience", 0)
-            sem_align = item["raw_semantic"]
+            sem = item["raw_semantic"]
 
-            # --- DATA-DRIVEN TIERED ADJECTIVE EVALUATIONS ---
-            resp_rate = int(sigs.get("recruiter_response_rate", 0.0) * 100)
-            if resp_rate >= 85:
-                resp_label = "highly responsive recruiter interaction"
-            elif resp_rate < 40:
-                resp_label = "limited recruiter responsiveness"
-            else:
-                resp_label = "moderate recruiter engagement"
+            resp = int(sigs.get("recruiter_response_rate", 0.0) * 100)
+            resp_label = (
+                "highly responsive to recruiter outreach" if resp >= 85
+                else "limited recruiter responsiveness" if resp < 40
+                else "moderate recruiter engagement"
+            )
 
-            completion = int(sigs.get("interview_completion_rate", 0.0) * 100)
-            if completion >= 90:
-                comp_label = "excellent interview attendance history"
-            elif completion < 60:
-                comp_label = "unreliable interview completion metrics"
-            else:
-                comp_label = "stable interview consistency"
+            comp = int(sigs.get("interview_completion_rate", 0.0) * 100)
+            comp_label = (
+                "excellent interview attendance history" if comp >= 90
+                else "unreliable interview completion" if comp < 60
+                else "stable interview consistency"
+            )
 
-            active_str = sigs.get("last_active_date", "")
             try:
-                days_ago = (datetime(2026, 6, 19) - datetime.strptime(active_str, "%Y-%m-%d")).days
-                # --- BUGFIX: BAKE THE GRAMMAR ARTICLE INTO THE LOGIC BRANCHES ---
-                active_context = f"an active footprint (last seen {days_ago}d ago)" if days_ago <= 30 else "a passive candidate footprint"
-            except:
-                active_context = "a tracked platform activity history"
+                days_ago = (
+                    datetime(2026, 6, 19)
+                    - datetime.strptime(sigs.get("last_active_date", ""), "%Y-%m-%d")
+                ).days
+                active_ctx = (
+                    f"an active footprint (last seen {days_ago}d ago)"
+                    if days_ago <= 30
+                    else "a passive candidate footprint"
+                )
+            except Exception:
+                active_ctx = "a tracked platform footprint"
 
-            # Construct cohesive professional rationale for human review judges
             reasoning = (
-                f"{title} with {exp} years of history showing a strong {sem_align} semantic fit for the JD. "
-                f"Demonstrates {resp_label} ({resp_rate}%), {comp_label} ({completion}%), and {active_context}."
+                f"{title} with {exp} years of history showing a strong {sem} semantic fit "
+                f"for the JD. Demonstrates {resp_label} ({resp}%), {comp_label} ({comp}%), "
+                f"and {active_ctx}."
             )
 
             writer.writerow({
                 "candidate_id": item["candidate_id"],
                 "rank": rank,
                 "score": item["score"],
-                "reasoning": reasoning
+                "reasoning": reasoning,
             })
 
-    print(f"🏁 SUCCESS! Standalone semantic-first submission exported to '{output_filename}'")
+    print(f"🏁 Done — submission written to '{output_filename}'")
 
-    def deploy_validation_script():
-    """Generates the official validate_submission.py file inside the active workspace."""
-    validate_code = """
-import csv
-import re
-from pathlib import Path
 
-REQUIRED_HEADER = ["candidate_id", "rank", "score", "reasoning"]
-CANDIDATE_ID_PATTERN = re.compile(r"^CAND_[0-9]{7}$")
-
-def validate_submission(csv_path):
-    errors = []
-    path = Path(csv_path)
-    if path.suffix.lower() != ".csv":
-        errors.append("Filename must use a .csv extension.")
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            try:
-                header = next(reader)
-            except StopIteration:
-                return ["Row 1 must be the header row; file is empty."]
-            if header != REQUIRED_HEADER:
-                return [f"Row 1 (header) must be exactly: {','.join(REQUIRED_HEADER)}"]
-            seen_ranks = set()
-            by_rank = []
-            for row_num, row in enumerate(reader, start=2):
-                if not row: continue
-                if len(row) < 4:
-                    errors.append(f"Row {row_num}: Must have 4 elements.")
-                    continue
-                cid, rank_s, score_s = row[0], row[1], row[2]
-                if not CANDIDATE_ID_PATTERN.match(cid):
-                    errors.append(f"Row {row_num}: Invalid candidate_id '{cid}'.")
-                try:
-                    rank = int(rank_s)
-                    seen_ranks.add(rank)
-                except ValueError:
-                    errors.append(f"Row {row_num}: rank must be an integer.")
-                    rank = None
-                try:
-                    score = float(score_s)
-                except ValueError:
-                    errors.append(f"Row {row_num}: score must be a float.")
-                    score = None
-                if rank is not None and score is not None:
-                    by_rank.append((rank, score, cid))
-            missing = set(range(1, 101)) - seen_ranks
-            if missing:
-                errors.append(f"Missing ranks: {sorted(missing)}")
-            by_rank.sort(key=lambda x: x[0])
-            for i in range(len(by_rank) - 1):
-                if by_rank[i][1] < by_rank[i+1][1]:
-                    errors.append(f"Score violation: rank {by_rank[i][0]} < rank {by_rank[i+1][0]}.")
-                if by_rank[i][1] == by_rank[i+1][1] and by_rank[i][2] > by_rank[i+1][2]:
-                    errors.append(f"Tie-breaker error at ranks {by_rank[i][0]} and {by_rank[i+1][0]}.")
-    except Exception as e:
-        errors.append(f"Could not read file: {e}")
-    return errors
-
-if __name__ == '__main__':
-    issues = validate_submission('submission.csv')
-    if not issues:
-        print("🎉 SUCCESS: Your submission file is flawless and perfectly formatted!")
-    else:
-        print("❌ VALIDATION FAILED:")
-        for err in issues: print(f"  - {err}")
-"""
-    with open("validate_submission.py", "w", encoding="utf-8") as f:
-        f.write(validate_code.strip())
-    print("✅ validate_submission.py has been deployed to the workspace directory.")
-
-    if __name__ == "__main__":
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
     if os.path.exists(TARGET_FILE):
-        # 1. Execute stream cleaning filter (Step 1)
         clean_pool = stream_and_filter_candidates(TARGET_FILE)
-
-        # 2. Compute normalizations and batched text vector structures (Steps 2-5)
         run_production_semantic_pipeline(clean_pool, output_filename=OUTPUT_FILE)
-
-        # 3. Deploy local automated validator environment
-        deploy_validation_script()
     else:
-        print(f"⚠️ Missing critical '{TARGET_FILE}' source dataset in current workspace directory!")
+        print(f"⚠️  Dataset '{TARGET_FILE}' not found in working directory.")
+        print("   Place candidates.jsonl alongside this script and re-run.")
